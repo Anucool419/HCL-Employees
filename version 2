@@ -1,0 +1,157 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+def run_prediction_system():
+    # --- 1. SETUP & TRAINING ---
+    file_path = input("Enter the path to your CSV file (e.g., Online_Retail_Filtered.csv): ").strip('"')
+    
+    print("\n[System] Loading data and training models... Please wait.")
+    try:
+        df = pd.read_csv(r"C:\Users\BARATHI\Downloads\Online_Retail_Filtered.csv")
+    except FileNotFoundError:
+        print("Error: File not found.")
+        return
+
+    df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
+    df['Amount'] = df['Quantity'] * df['UnitPrice']
+
+    # Define Time Windows
+    # Train: Dec 2010 -> Sep 2011 (10 Months)
+    # Test: Oct 2011 (1 Month - used to calculate MAE/RMSE/R2)
+    train_start = pd.Timestamp('2010-12-01')
+    train_end = pd.Timestamp('2011-09-30 23:59:59')
+    test_start = pd.Timestamp('2011-10-01')
+    test_end = pd.Timestamp('2011-10-31 23:59:59')
+
+    # Helper to build dataset
+    def build_dataset(df_full, feature_start, feature_end, target_start, target_end):
+        # Features (History)
+        mask_X = (df_full['InvoiceDate'] >= feature_start) & (df_full['InvoiceDate'] <= feature_end)
+        df_X = df_full.loc[mask_X].copy()
+        
+        df_X['YearMonth'] = df_X['InvoiceDate'].dt.to_period('M')
+        
+        X = df_X.groupby('CustomerID').agg({
+            'InvoiceDate': lambda x: (feature_end - x.max()).days, # Recency
+            'InvoiceNo': 'nunique',                                # Frequency
+            'Amount': 'sum',                                       # Monetary
+            'Quantity': 'sum',                                     # Total Items
+            'YearMonth': 'nunique',                                # Months Active
+        }).rename(columns={'YearMonth': 'MonthsActive'})
+        
+        # Min Monthly Qty (for Categorization)
+        monthly_qty = df_X.groupby(['CustomerID', 'YearMonth'])['Quantity'].sum().reset_index()
+        min_monthly = monthly_qty.groupby('CustomerID')['Quantity'].min()
+        X = X.join(min_monthly.rename('MinMonthlyQuantity'))
+        
+        X.columns = ['Recency', 'Frequency', 'Monetary', 'TotalItems', 'MonthsActive', 'MinMonthlyQuantity']
+        
+        # Target (Future)
+        mask_y = (df_full['InvoiceDate'] >= target_start) & (df_full['InvoiceDate'] <= target_end)
+        df_y = df_full.loc[mask_y]
+        
+        y = df_y.groupby('CustomerID').agg({
+            'Amount': 'sum',
+            'Quantity': 'sum'
+        }).rename(columns={'Amount': 'Target_Spend', 'Quantity': 'Target_Quantity'})
+        
+        # Merge
+        return X.merge(y, on='CustomerID', how='left').fillna(0)
+
+    # Build Data
+    data = build_dataset(df, train_start, train_end, test_start, test_end)
+
+    # Categorization Logic (Based on 10 months history)
+    def assign_category(row):
+        months = row['MonthsActive']
+        min_qty = row['MinMonthlyQuantity']
+        
+        if months == 10: 
+            if min_qty >= 50: return 'Diamond'
+            elif min_qty >= 30: return 'Gold'
+            elif min_qty >= 20: return 'Silver'
+            elif min_qty >= 10: return 'Bronze'
+            else: return 'Iron'
+        elif months >= 7: return 'VJS'
+        elif months >= 3: return 'Mr.D'
+        elif months >= 1: return 'AK'
+        else: return 'Unknown'
+
+    data['Category'] = data.apply(assign_category, axis=1)
+
+    # Train Models
+    features = ['Recency', 'Frequency', 'Monetary', 'TotalItems']
+    X = data[features]
+    y_spend = data['Target_Spend']
+    y_qty = data['Target_Quantity']
+
+    model_spend = LinearRegression()
+    model_spend.fit(X, y_spend)
+    
+    model_qty = LinearRegression()
+    model_qty.fit(X, y_qty)
+
+    # Calculate Global Metrics (Based on Test Month)
+    preds_spend = model_spend.predict(X)
+    mae = mean_absolute_error(y_spend, preds_spend)
+    rmse = np.sqrt(mean_squared_error(y_spend, preds_spend))
+    r2 = r2_score(y_spend, preds_spend)
+
+    print("\n" + "="*50)
+    print(" MODEL TRAINED SUCCESSFULLY ")
+    print("="*50)
+
+    # --- 2. INTERACTIVE LOOP ---
+    while True:
+        user_input = input("\nEnter Customer ID (or type 'exit' to quit): ")
+        
+        if user_input.lower() == 'exit':
+            print("Exiting...")
+            break
+        
+        try:
+            cust_id = int(user_input)
+            
+            if cust_id not in data.index:
+                print(f"Error: Customer ID {cust_id} not found in historical data.")
+                continue
+                
+            # Get Customer Stats
+            row = data.loc[cust_id]
+            category = row['Category']
+            
+            # Predict Next 30 Days
+            cust_features = pd.DataFrame([row[features]])
+            pred_spend = model_spend.predict(cust_features)[0]
+            pred_qty = model_qty.predict(cust_features)[0]
+            
+            # Logic: Will they visit? (Based on Consistency & Predicted Spend)
+            prob = row['MonthsActive'] / 10.0
+            if prob >= 0.3 and pred_spend > 0:
+                visit_status = "YES, Likely to Visit"
+            else:
+                visit_status = "NO / Unlikely"
+
+            # DISPLAY OUTPUT
+            print("\n" + "-"*40)
+            print(f" PREDICTION RESULTS FOR CUSTOMER: {cust_id}")
+            print("-"*40)
+            print(f"Customer Category:        {category}")
+            print(f"Visit Next 30 Days?:      {visit_status}")
+            print(f"Likely to Buy (Qty):      {int(max(0, pred_qty))} Products")
+            print(f"Estimated Cost:           ${max(0, pred_spend):.2f}")
+            print("-" * 40)
+            print(" MODEL ACCURACY METRICS (Test Data)")
+            print(f" MAE:  {mae:.2f}")
+            print(f" R²:   {r2:.4f}")
+            print(f" RMSE: {rmse:.2f}")
+            print("-" * 40)
+
+        except ValueError:
+            print("Please enter a valid numeric Customer ID.")
+
+# Run the system
+if __name__ == "__main__":
+    run_prediction_system()
