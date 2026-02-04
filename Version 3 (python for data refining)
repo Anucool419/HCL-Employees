@@ -1,0 +1,147 @@
+import pandas as pd
+import os
+
+os.chdir(r'file path')   #...... add file path
+
+# 1. Load the dataset
+file_name = 'Online Retail.xlsx'
+if os.path.exists(file_name):
+    df_orig = pd.read_excel(file_name)
+elif os.path.exists('Online Retail.csv'):
+    df_orig = pd.read_csv('Online Retail.csv')
+else:
+    raise FileNotFoundError("File not found. Please check the name and location.")
+
+# Work on a copy for filtering
+df = df_orig.copy()
+
+# --- Apply Conditions ---
+
+# 1. InvoiceDate: Valid datetime
+df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'], errors='coerce')
+df = df.dropna(subset=['InvoiceDate'])
+df = df[df['InvoiceDate'].dt.year > 1999]
+
+# 2. Customer ID: Char length = 5
+df = df.dropna(subset=['CustomerID'])
+df['CustomerID'] = df['CustomerID'].astype(int).astype(str)
+df = df[df['CustomerID'].str.len() == 5]
+
+# 3. Invoice No: Char length = 6
+df = df[df['InvoiceNo'].astype(str).str.len() == 6]
+
+# 4. StockCode: 5 to 10 chars
+df['StockCode'] = df['StockCode'].astype(str)
+stock_len = df['StockCode'].str.len()
+df = df[(stock_len >= 5) & (stock_len <= 10)]
+
+# 5. Description: 1 to 100 chars
+df = df.dropna(subset=['Description'])
+df['Description'] = df['Description'].astype(str)
+desc_len = df['Description'].str.len()
+df = df[(desc_len >= 1) & (desc_len <= 100)]
+
+# 6. Quantity: >= 1
+df = df[df['Quantity'] >= 1]
+
+# 7. Unit Price: >= 0.01
+df = df[df['UnitPrice'] >= 0.01]
+
+# 8. Country: 1 to 30 chars
+df['Country'] = df['Country'].astype(str)
+country_len = df['Country'].str.len()
+df = df[(country_len >= 1) & (country_len <= 30)]
+
+# --- Separation ---
+
+# df now contains only the kept rows
+df_kept = df
+
+# Use the index to identify which rows were dropped from the original dataframe
+# This creates a dataframe of all the data that was filtered out
+df_removed = df_orig.loc[~df_orig.index.isin(df_kept.index)]
+
+# --- Save Files ---
+
+df_kept.to_csv('Online_Retail_Filtered.csv', index=False)
+df_removed.to_csv('Online_Retail_Removed.csv', index=False)
+
+print(f"Filtered data saved: {len(df_kept)} rows")
+print(f"Removed data saved: {len(df_removed)} rows")
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import numpy as np
+
+# --- Step 0: Preparation ---
+# Load your cleaned data
+df = pd.read_csv('Online_Retail_Filtered.csv')
+df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
+
+# Create a 'TotalSpend' column (Essential for calculating monetary value)
+df['TotalSpend'] = df['Quantity'] * df['UnitPrice']
+
+# --- Step 1: Define the "Time Machine" (Cutoff Date) ---
+# We take the very last date in the dataset and subtract 30 days
+max_date = df['InvoiceDate'].max()
+cutoff_date = max_date - pd.Timedelta(days=30)
+
+print(f"Dataset Range: {df['InvoiceDate'].min()} to {max_date}")
+print(f"Training on data before: {cutoff_date}")
+print(f"Predicting spend for period: {cutoff_date} to {max_date}")
+
+# --- Step 2: Split Data into 'Past' (Features) and 'Future' (Target) ---
+historical_data = df[df['InvoiceDate'] <= cutoff_date]
+future_data = df[df['InvoiceDate'] > cutoff_date]
+
+# --- Step 3: Feature Engineering (The 'X') ---
+# We transform transactions into a single row per customer
+# R = Recency (days since last purchase)
+# F = Frequency (number of purchases)
+# M = Monetary (total spend)
+
+features = historical_data.groupby('CustomerID').agg({
+    'InvoiceDate': lambda x: (cutoff_date - x.max()).days, # Recency
+    'InvoiceNo': 'nunique',                                 # Frequency
+    'TotalSpend': 'sum'                                     # Monetary (Past)
+}).reset_index()
+
+features.columns = ['CustomerID', 'Recency', 'Frequency', 'Monetary']
+
+# --- Step 4: Create Target (The 'y') ---
+# Calculate how much each customer ACTUALLY spent in the last 30 days
+target = future_data.groupby('CustomerID')['TotalSpend'].sum().reset_index()
+target.columns = ['CustomerID', 'FutureSpend_30Days']
+
+# --- Step 5: Merge Features and Target ---
+# We join them. IMPORTANT: If a customer is in 'features' but not in 'target',
+# it means they spent 0 in the future period. We fill NaN with 0.
+final_df = pd.merge(features, target, on='CustomerID', how='left')
+final_df['FutureSpend_30Days'] = final_df['FutureSpend_30Days'].fillna(0)
+
+# --- Step 6: Modeling ---
+X = final_df[['Recency', 'Frequency', 'Monetary']]
+y = final_df['FutureSpend_30Days']
+
+# Split into train/test to evaluate performance
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train the model (Random Forest is robust for this)
+model = RandomForestRegressor(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# --- Step 7: Evaluation ---
+predictions = model.predict(X_test)
+
+# Calculate metrics
+mae = mean_absolute_error(y_test, predictions)
+mse = mean_squared_error(y_test, predictions)
+rmse = np.sqrt(mse)  # Calculate Root Mean Squared Error
+r2 = r2_score(y_test, predictions)
+
+print("--- Model Performance ---")
+print(f"Mean Absolute Error (MAE): {mae:.2f}")
+print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
+print(f"R² Score: {r2:.2f}")
