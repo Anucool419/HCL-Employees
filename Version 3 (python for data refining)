@@ -145,3 +145,111 @@ print("--- Model Performance ---")
 print(f"Mean Absolute Error (MAE): {mae:.2f}")
 print(f"Root Mean Squared Error (RMSE): {rmse:.2f}")
 print(f"R² Score: {r2:.2f}")
+
+
+#--- For the UI design I used Straemlit --
+# We need this so the App can look up "Customer 12345" and find their Recency/Frequency/Monetary
+final_df.to_csv('customer_data.csv', index=False)
+print("Customer data saved as customer_data.csv")
+
+import streamlit as st
+import pandas as pd
+import pickle
+
+# --- Configuration ---
+st.set_page_config(page_title="HCL Hackathon Prediction", page_icon="💰")
+
+# --- 1. Load Data & Model ---
+@st.cache_data
+def load_data():
+    # Load the customer database we saved in Step 1
+    # We force CustomerID to be string so we can search easily
+    data = pd.read_csv('customer_data.csv')
+    data['CustomerID'] = data['CustomerID'].astype(int).astype(str)
+    return data
+
+@st.cache_resource
+def load_model():
+    with open('model.pkl', 'rb') as f:
+        model = pickle.load(f)
+    return model
+
+try:
+    df = load_data()
+    model = load_model()
+except FileNotFoundError:
+    st.error("⚠️ Files not found! Make sure 'customer_data.csv' and 'model.pkl' are in this folder.")
+    st.stop()
+
+# --- 2. Sidebar / Header ---
+st.title("💰 Customer Value Predictor")
+st.markdown("Enter a Customer ID to predict their spending for the **next 30 days**.")
+
+# --- 3. User Input ---
+# Create a text input for ID
+customer_id = st.text_input("Enter Customer ID", placeholder="e.g., 12346")
+
+# --- 4. Prediction Logic ---
+if st.button("Predict Spend"):
+    if customer_id:
+        # Search for the customer in our database
+        customer_row = df[df['CustomerID'] == customer_id]
+        
+        if not customer_row.empty:
+            # Found them! Extract their features
+            recency = customer_row.iloc[0]['Recency']
+            frequency = customer_row.iloc[0]['Frequency']
+            monetary = customer_row.iloc[0]['Monetary']
+            
+            # Prepare data for model
+            input_features = pd.DataFrame({
+                'Recency': [recency],
+                'Frequency': [frequency],
+                'Monetary': [monetary]
+            })
+            
+            # Predict
+            prediction = model.predict(input_features)[0]
+            
+            # --- 5. Display Results ---
+            st.success("Analysis Complete")
+            
+            # Get the ACTUAL value from the file (The 'Answer Key')
+            actual_future_spend = customer_row.iloc[0]['FutureSpend_30Days']
+            
+            # Create 4 columns to show everything
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("AI Prediction", f"£{prediction:.2f}")
+            
+            with col2:
+                # Show the REAL answer so judges can compare
+                st.metric("Actual Future Spend", f"£{actual_future_spend:.2f}")
+
+            with col3:
+                st.metric("Past Total Spend", f"£{monetary:.2f}")
+            
+            with col4:
+                st.metric("Days Since Visit", f"{int(recency)} days")
+            
+            # Insight Logic
+            st.subheader("💡 Actionable Insight")
+            if prediction > 500:
+                st.info("🌟 **High Priority:** High predicted value.")
+            elif prediction < 10 and actual_future_spend > 1000:
+                 # Special message for when the AI is wrong (like this case)
+                 st.warning(f"⚠️ **Outlier Detected:** This is a 'Whale' customer. The AI predicts churn, but they actually spent £{actual_future_spend:.2f}. Human intervention required!")
+            elif prediction > 50:
+                st.warning("🔄 **Retention Opportunity:** Moderate expected spend.")
+            else:
+                st.error("⚠️ **Churn Risk:** Low expected spend.")
+        else:
+            st.error(f"Customer ID {customer_id} not found in the database.")
+    else:
+        st.warning("Please enter a Customer ID.")
+
+# --- 6. (Optional) Show Data Snippet ---
+with st.expander("View Raw Data for this Customer"):
+    if customer_id and not df[df['CustomerID'] == customer_id].empty:
+        st.dataframe(df[df['CustomerID'] == customer_id])
