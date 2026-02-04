@@ -1,69 +1,82 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-def run_prediction_system():
-    # --- 1. SETUP & TRAINING ---
-    file_path = input("Enter the path to your CSV file (e.g., Online_Retail_Filtered.csv): ").strip('"')
-    
-    print("\n[System] Loading data and training models... Please wait.")
-    try:
-        df = pd.read_csv(r"C:\Users\BARATHI\Downloads\Online_Retail_Filtered.csv")
-    except FileNotFoundError:
-        print("Error: File not found.")
-        return
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="Customer Value Predictor", page_icon="🛍️", layout="wide")
 
+# --- CUSTOM CSS FOR "HACKATHON" LOOK ---
+st.markdown("""
+    <style>
+    .metric-card {
+        background-color: #f0f2f6;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #FF4B4B;
+        color: white;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- CACHED FUNCTIONS (To speed up the app) ---
+@st.cache_data
+def load_and_process_data(uploaded_file):
+    """
+    Loads raw data, engineers features, and calculates global metrics.
+    Only runs once when the file is uploaded.
+    """
+    # 1. Load Data
+    df = pd.read_csv(uploaded_file)
     df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
     df['Amount'] = df['Quantity'] * df['UnitPrice']
 
-    # Define Time Windows
-    # Train: Dec 2010 -> Sep 2011 (10 Months)
-    # Test: Oct 2011 (1 Month - used to calculate MAE/RMSE/R2)
+    # 2. Define Split Dates
     train_start = pd.Timestamp('2010-12-01')
     train_end = pd.Timestamp('2011-09-30 23:59:59')
     test_start = pd.Timestamp('2011-10-01')
     test_end = pd.Timestamp('2011-10-31 23:59:59')
 
-    # Helper to build dataset
-    def build_dataset(df_full, feature_start, feature_end, target_start, target_end):
-        # Features (History)
+    # 3. Helper: Build Dataset (RFM Features)
+    def build_dataset_internal(df_full, feature_start, feature_end, target_start, target_end):
+        # Features (X)
         mask_X = (df_full['InvoiceDate'] >= feature_start) & (df_full['InvoiceDate'] <= feature_end)
         df_X = df_full.loc[mask_X].copy()
-        
         df_X['YearMonth'] = df_X['InvoiceDate'].dt.to_period('M')
-        
+
         X = df_X.groupby('CustomerID').agg({
-            'InvoiceDate': lambda x: (feature_end - x.max()).days, # Recency
-            'InvoiceNo': 'nunique',                                # Frequency
-            'Amount': 'sum',                                       # Monetary
-            'Quantity': 'sum',                                     # Total Items
-            'YearMonth': 'nunique',                                # Months Active
-        }).rename(columns={'YearMonth': 'MonthsActive'})
-        
-        # Min Monthly Qty (for Categorization)
+            'InvoiceDate': lambda x: (feature_end - x.max()).days,
+            'InvoiceNo': 'nunique',
+            'Amount': 'sum',
+            'Quantity': 'sum',
+            'YearMonth': 'nunique',
+        }).rename(columns={'YearMonth': 'MonthsActive', 'InvoiceDate': 'Recency', 
+                           'InvoiceNo': 'Frequency', 'Amount': 'Monetary', 'Quantity': 'TotalItems'})
+
+        # Min Monthly Quantity
         monthly_qty = df_X.groupby(['CustomerID', 'YearMonth'])['Quantity'].sum().reset_index()
         min_monthly = monthly_qty.groupby('CustomerID')['Quantity'].min()
         X = X.join(min_monthly.rename('MinMonthlyQuantity'))
-        
-        X.columns = ['Recency', 'Frequency', 'Monetary', 'TotalItems', 'MonthsActive', 'MinMonthlyQuantity']
-        
-        # Target (Future)
+
+        # Target (Y)
         mask_y = (df_full['InvoiceDate'] >= target_start) & (df_full['InvoiceDate'] <= target_end)
         df_y = df_full.loc[mask_y]
-        
         y = df_y.groupby('CustomerID').agg({
             'Amount': 'sum',
             'Quantity': 'sum'
         }).rename(columns={'Amount': 'Target_Spend', 'Quantity': 'Target_Quantity'})
-        
-        # Merge
+
         return X.merge(y, on='CustomerID', how='left').fillna(0)
 
-    # Build Data
-    data = build_dataset(df, train_start, train_end, test_start, test_end)
+    # 4. Build Data
+    data = build_dataset_internal(df, train_start, train_end, test_start, test_end)
 
-    # Categorization Logic (Based on 10 months history)
+    # 5. Categorization Logic
     def assign_category(row):
         months = row['MonthsActive']
         min_qty = row['MinMonthlyQuantity']
@@ -80,78 +93,112 @@ def run_prediction_system():
         else: return 'Unknown'
 
     data['Category'] = data.apply(assign_category, axis=1)
+    
+    return data
 
-    # Train Models
+def train_models(data):
+    """Trains the models and returns them along with metrics."""
     features = ['Recency', 'Frequency', 'Monetary', 'TotalItems']
     X = data[features]
     y_spend = data['Target_Spend']
     y_qty = data['Target_Quantity']
 
+    # Train
     model_spend = LinearRegression()
     model_spend.fit(X, y_spend)
     
     model_qty = LinearRegression()
     model_qty.fit(X, y_qty)
 
-    # Calculate Global Metrics (Based on Test Month)
+    # Metrics
     preds_spend = model_spend.predict(X)
-    mae = mean_absolute_error(y_spend, preds_spend)
-    rmse = np.sqrt(mean_squared_error(y_spend, preds_spend))
-    r2 = r2_score(y_spend, preds_spend)
+    metrics = {
+        'mae': mean_absolute_error(y_spend, preds_spend),
+        'rmse': np.sqrt(mean_squared_error(y_spend, preds_spend)),
+        'r2': r2_score(y_spend, preds_spend)
+    }
+    
+    return model_spend, model_qty, metrics, features
 
-    print("\n" + "="*50)
-    print(" MODEL TRAINED SUCCESSFULLY ")
-    print("="*50)
+# --- MAIN UI LAYOUT ---
 
-    # --- 2. INTERACTIVE LOOP ---
-    while True:
-        user_input = input("\nEnter Customer ID (or type 'exit' to quit): ")
-        
-        if user_input.lower() == 'exit':
-            print("Exiting...")
-            break
-        
+st.title("🛍️ AI Retail Customer Predictor")
+st.markdown("Predict 30-day future spend and categorize customers based on purchase history.")
+
+# 1. SIDEBAR: DATA UPLOAD
+with st.sidebar:
+    st.header("1. Upload Data")
+    uploaded_file = st.file_uploader("Upload 'Online_Retail.csv'", type=["csv"])
+    
+    st.info("System expects columns: InvoiceDate, Quantity, UnitPrice, CustomerID, InvoiceNo")
+
+if uploaded_file is not None:
+    # 2. PROCESS DATA (Only runs once)
+    with st.spinner("Processing data, engineering features, and training models..."):
         try:
-            cust_id = int(user_input)
+            data = load_and_process_data(uploaded_file)
+            model_spend, model_qty, metrics, feature_cols = train_models(data)
+            st.success("Model Trained Successfully!")
+        except Exception as e:
+            st.error(f"Error processing file: {e}")
+            st.stop()
+
+    # 3. DISPLAY GLOBAL METRICS
+    st.markdown("### 📊 Model Performance (Global)")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("MAE (Error)", f"${metrics['mae']:.2f}")
+    col2.metric("RMSE", f"{metrics['rmse']:.2f}")
+    col3.metric("R² Score", f"{metrics['r2']:.4f}")
+    st.divider()
+
+    # 4. PREDICTION INTERFACE
+    st.header("2. Predict Specific Customer")
+    
+    # Input ID
+    cust_id_input = st.number_input("Enter Customer ID", min_value=1, step=1, value=int(data.index[0]))
+
+    if st.button("Generate Prediction"):
+        if cust_id_input in data.index:
+            # Fetch Data
+            row = data.loc[cust_id_input]
+            cust_features = pd.DataFrame([row[feature_cols]])
             
-            if cust_id not in data.index:
-                print(f"Error: Customer ID {cust_id} not found in historical data.")
-                continue
-                
-            # Get Customer Stats
-            row = data.loc[cust_id]
-            category = row['Category']
-            
-            # Predict Next 30 Days
-            cust_features = pd.DataFrame([row[features]])
+            # Predict
             pred_spend = model_spend.predict(cust_features)[0]
             pred_qty = model_qty.predict(cust_features)[0]
             
-            # Logic: Will they visit? (Based on Consistency & Predicted Spend)
+            # Logic: Visit Likelihood
             prob = row['MonthsActive'] / 10.0
-            if prob >= 0.3 and pred_spend > 0:
-                visit_status = "YES, Likely to Visit"
-            else:
-                visit_status = "NO / Unlikely"
+            visit_likely = (prob >= 0.3 and pred_spend > 0)
+            
+            # --- DISPLAY RESULTS ---
+            st.subheader(f"Results for Customer: {cust_id_input}")
+            
+            # Top Row: Category & Status
+            c1, c2 = st.columns(2)
+            with c1:
+                st.info(f"**Customer Category:** {row['Category']}")
+            with c2:
+                if visit_likely:
+                    st.success("**Likely to Visit?** YES ✅")
+                else:
+                    st.error("**Likely to Visit?** NO ❌")
 
-            # DISPLAY OUTPUT
-            print("\n" + "-"*40)
-            print(f" PREDICTION RESULTS FOR CUSTOMER: {cust_id}")
-            print("-"*40)
-            print(f"Customer Category:        {category}")
-            print(f"Visit Next 30 Days?:      {visit_status}")
-            print(f"Likely to Buy (Qty):      {int(max(0, pred_qty))} Products")
-            print(f"Estimated Cost:           ${max(0, pred_spend):.2f}")
-            print("-" * 40)
-            print(" MODEL ACCURACY METRICS (Test Data)")
-            print(f" MAE:  {mae:.2f}")
-            print(f" R²:   {r2:.4f}")
-            print(f" RMSE: {rmse:.2f}")
-            print("-" * 40)
+            # Bottom Row: Numbers
+            c3, c4 = st.columns(2)
+            c3.metric(label="Predicted 30-Day Spend", value=f"${max(0, pred_spend):.2f}")
+            c4.metric(label="Predicted Items (Qty)", value=f"{int(max(0, pred_qty))}")
 
-        except ValueError:
-            print("Please enter a valid numeric Customer ID.")
+            # Optional: Show their history for context
+            with st.expander("View Customer History"):
+                st.dataframe(row)
 
-# Run the system
-if __name__ == "__main__":
-    run_prediction_system()
+        else:
+            st.warning(f"Customer ID {cust_id_input} not found in the historical training data.")
+
+else:
+    st.markdown("""
+    <div style='text-align: center; margin-top: 50px;'>
+        <h3>⬅️ Please upload a CSV file to begin.</h3>
+    </div>
+    """, unsafe_allow_html=True)
