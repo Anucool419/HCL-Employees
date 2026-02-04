@@ -1,0 +1,83 @@
+
+CREATE TABLE clean_transactions AS
+SELECT
+    invoice_no,
+    stock_code,
+    description,
+    CAST(quantity AS SIGNED) AS quantity,
+    STR_TO_DATE(invoice_date, '%m/%d/%Y %H:%i') AS invoice_date,
+    CAST(unit_price AS DECIMAL(10,2)) AS unit_price,
+    CAST(customer_id AS SIGNED) AS customer_id,
+    country
+FROM raw_transactions
+WHERE
+    customer_id REGEXP '^[0-9]+'
+    AND quantity REGEXP '^-?[0-9]+'
+    AND unit_price REGEXP '^[0-9]+(\\.[0-9]+)?'
+    AND CAST(quantity AS SIGNED) > 0
+    AND CAST(unit_price AS DECIMAL(10,2)) > 0
+    AND STR_TO_DATE(invoice_date, '%m/%d/%Y %H:%i') IS NOT NULL;
+
+CREATE TABLE bad_records AS
+SELECT *,
+    CASE
+        WHEN customer_id IS NULL OR customer_id = '' THEN 'Missing customer_id'
+        WHEN quantity IS NULL OR quantity = '' THEN 'Missing quantity'
+        WHEN unit_price IS NULL OR unit_price = '' THEN 'Missing price'
+        WHEN CAST(quantity AS SIGNED) <= 0 THEN 'Invalid quantity'
+        WHEN CAST(unit_price AS DECIMAL(10,2)) <= 0 THEN 'Invalid price'
+        ELSE 'Other'
+    END AS error_reason
+FROM raw_transactions
+WHERE
+    customer_id IS NULL OR customer_id = ''
+    OR quantity IS NULL OR quantity = ''
+    OR unit_price IS NULL OR unit_price = ''
+    OR CAST(quantity AS SIGNED) <= 0
+    OR CAST(unit_price AS DECIMAL(10,2)) <= 0;
+select DISTINCT(country) from clean_transactions;
+select country,count(country) from clean_transactions group by country;
+select * from bad_records;
+select * from clean_transactions;
+select * from raw_transactions;
+CREATE TABLE customer_transaction_summary AS
+SELECT
+    customer_id,
+    COUNT(DISTINCT invoice_no) AS total_transactions,
+    SUM(quantity) AS total_quantity,
+    SUM(quantity * unit_price) AS total_spend,
+    AVG(quantity * unit_price) AS avg_order_value,
+    MIN(invoice_date) AS first_purchase_date,
+    MAX(invoice_date) AS last_purchase_date,
+    COUNT(DISTINCT DATE(invoice_date)) AS active_days,
+    COUNT(DISTINCT stock_code) AS unique_products
+FROM clean_transactions
+GROUP BY customer_id;
+drop table customer_summary;
+select * from customer_transaction_summary;
+CREATE TABLE customer_monthly_spend AS
+SELECT
+    customer_id,
+    date_format(invoice_date,'%Y-%m-%d') AS txn_month,
+    SUM(quantity * unit_price) AS monthly_spend
+FROM clean_transactions
+GROUP BY customer_id, date_format(invoice_date,'%Y-%m-%d');
+select * from customer_monthly_spend;
+CREATE TABLE train_data AS
+SELECT *
+FROM customer_monthly_spend
+WHERE txn_month < '2011-08-01';
+
+CREATE TABLE test_data AS
+SELECT *
+FROM customer_monthly_spend
+WHERE txn_month >= '2011-08-01';
+
+show tables;
+select * from test_data;
+select * from train_data;
+drop table train_data;
+drop table test_data;
+SELECT *
+INTO OUTFILE '/tmp/transactions.csv';
+select c.customer_id,c.total_transactions,c.total_quantity,c.total_spend,c.avg_order_value, c.first_purchase_date, c.last_purchase_date, c.active_days,c.unique_products, t.txn_month,t.monthly_spend from customer_transaction_summary c join test_data t on c.customer_id=t.customer_id;
